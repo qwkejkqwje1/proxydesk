@@ -1,0 +1,41 @@
+# THIRD-PARTY NOTICES
+
+Проект **ProxyDesk** использует следующие сторонние библиотеки с открытым исходным кодом (только с разрешительными лицензиями BSD / MIT / Apache-2.0):
+
+---
+
+## 1. Прямые и транзитивные зависимости Go (`go.mod`)
+
+### modernc.org/sqlite (и связанные пакеты modernc.org/libc, modernc.org/memory, modernc.org/mathutil, modernc.org/strutil, modernc.org/token, modernc.org/gc/v3)
+- **Лицензия**: BSD-3-Clause
+- **Правообладатели**: Copyright (c) 2017-2024 The Sqlite Authors / CzNic. All rights reserved.
+- **SQLite Public Domain Notice**: Оригинальный код C-библиотеки SQLite (автор D. Richard Hipp), транслированный в Go, находится в общественном достоянии (Public Domain).
+
+### golang.org/x/sys
+- **Лицензия**: BSD-3-Clause
+- **Правообладатели**: Copyright (c) 2009 The Go Authors. All rights reserved.
+
+### github.com/google/uuid
+- **Лицензия**: BSD-3-Clause
+- **Правообладатели**: Copyright (c) 2009, 2014 Google Inc. All rights reserved.
+
+### github.com/hashicorp/golang-lru/v2
+- **Лицензия**: MPL-2.0
+- **Правообладатели**: Copyright (c) HashiCorp, Inc.
+
+### github.com/dustin/go-humanize, github.com/mattn/go-isatty, github.com/ncruces/go-strftime, github.com/remyoudompheng/bigfft
+- **Лицензия**: MIT / BSD-3-Clause
+
+---
+
+## 2. Сведения об исследованных референсных проектах
+
+1. **monosans/proxy-scraper-checker** (`https://github.com/monosans/proxy-scraper-checker`, commit `9a4b160`) и **monosans/proxy-list** (`https://github.com/monosans/proxy-list`, commit `acaa01e`)
+   - **Лицензия**: MIT License (`Copyright (c) monosans`).
+   - **Использование**: В ProxyDesk включены ссылки на проверенные публичные списки `monosans/proxy-list` в качестве опциональных предустановленных источников; исходный код на Rust не копировался.
+2. **mubeng/mubeng** (`https://github.com/mubeng/mubeng`, commit `963b14d`)
+   - **Лицензия**: Apache License 2.0 (`Copyright (c) 2021-2025 Dwi Siswanto`).
+   - **Использование**: Изучена концепция разделения ошибок проверки и ротации; исходный код не копировался.
+3. **zu1k/proxypool** (`https://github.com/zu1k/proxypool`, commit `cc42f38`)
+   - **Лицензия**: GNU General Public License v3.0 (GPL-3.0).
+   - **Использование**: Код **не использовался и не копировался** (clean-room реализация собственного менеджера источников).

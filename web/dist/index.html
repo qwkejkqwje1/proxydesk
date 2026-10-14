@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="proxydesk-token" content="__PROXYDESK_SESSION_TOKEN__">
+  <title>ProxyDesk — Портативный менеджер прокси и DNS</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1 id="app-title">ProxyDesk</h1>
+      <p id="app-subtitle" class="subtitle">Портативный менеджер прокси, локального шлюза и пользовательского DNS (Windows 10/11 x64)</p>
+    </div>
+    <div class="status-pills">
+      <span class="pill" id="pill-http-gw">HTTP GW: 127.0.0.1:18080</span>
+      <span class="pill" id="pill-socks-gw">SOCKS5 GW: 127.0.0.1:18081</span>
+      <span class="pill" id="pill-dns">DNS: 127.0.0.1:15353</span>
+    </div>
+  </header>
+
+  <nav class="tabs" id="main-tabs">
+    <button class="tab active" data-tab="overview">Обзор</button>
+    <button class="tab" data-tab="sources">Источники</button>
+    <button class="tab" data-tab="proxies">Прокси</button>
+    <button class="tab" data-tab="pools">Пулы и выбор</button>
+    <button class="tab" data-tab="gateway">Локальный шлюз и маршруты</button>
+    <button class="tab" data-tab="dns">DNS (пользовательский)</button>
+    <button class="tab" data-tab="logs">Журнал и диагностика</button>
+    <button class="tab" data-tab="settings">Настройки и бэкап</button>
+  </nav>
+
+  <main class="container">
+    <section id="panel-overview" class="panel active">
+      <div class="cards-grid">
+        <div class="stat-card"><span>Всего прокси в базе</span><strong id="stat-total">0</strong></div>
+        <div class="stat-card"><span>Рабочие (healthy)</span><strong id="stat-healthy">0</strong></div>
+        <div class="stat-card"><span>Не проверены (unknown)</span><strong id="stat-unknown">0</strong></div>
+        <div class="stat-card"><span>Нестабильные / Карантин</span><strong id="stat-quarantined">0 / 0</strong></div>
+        <div class="stat-card"><span>Источников</span><strong id="stat-sources">0</strong></div>
+      </div>
+      <div class="notice-box" id="system-stage-banner">
+        Системный перехват (WinINET/PAC, драйвер TUN/Wintun, WFP process routing, Kill Switch и смена системного DNS Windows) выделен в отдельный привилегированный этап и не активируется в пользовательском портативном режиме.
+      </div>
+    </section>
+
+    <section id="panel-sources" class="panel">
+      <div class="panel-header">
+        <h2>Источники прокси и ручной импорт</h2>
+        <div>
+          <button id="btn-export-sources" class="btn-secondary">Экспорт источников JSON</button>
+        </div>
+      </div>
+      <div class="split-grid">
+        <div class="box">
+          <h3>Ручной импорт списка (TXT)</h3>
+          <p class="hint">Новые прокси получают статус <code>unknown</code> до реальной сетевой проверки. Пароли не сохраняются на диск в открытом виде.</p>
+          <textarea id="manual-import-text" rows="5" placeholder="http://198.51.100.10:8080&#10;socks5://user:pass@203.0.113.20:1080"></textarea>
+          <div class="row">
+            <select id="manual-import-proto">
+              <option value="http">Протокол по умолчанию: HTTP</option>
+              <option value="socks5">Протокол по умолчанию: SOCKS5</option>
+            </select>
+            <label><input type="checkbox" id="manual-allow-private"> Разрешить приватные/локальные IP</label>
+            <button id="btn-manual-import" class="btn-primary">Импортировать</button>
+          </div>
+          <div id="manual-import-result" class="status-msg"></div>
+        </div>
+        <div class="box">
+          <h3>Добавить источник (URL / Локальный файл)</h3>
+          <div class="form-stack">
+            <input type="text" id="src-name" placeholder="Название источника">
+            <input type="text" id="src-location" placeholder="https://... или путь к файлу">
+            <div class="row">
+              <select id="src-kind">
+                <option value="url">URL</option>
+                <option value="file">Локальный файл</option>
+                <option value="html">Статический HTML</option>
+              </select>
+              <select id="src-format">
+                <option value="txt">TXT</option>
+                <option value="csv">CSV (host,port)</option>
+                <option value="json">JSON</option>
+                <option value="html">HTML</option>
+              </select>
+              <select id="src-proto">
+                <option value="http">HTTP</option>
+                <option value="socks5">SOCKS5</option>
+              </select>
+            </div>
+            <button id="btn-add-source" class="btn-primary">Сохранить источник</button>
+          </div>
+        </div>
+      </div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>ID</th><th>Название</th><th>Тип / Формат</th><th>URL / Путь</th><th>Статус</th><th>Уникальных / Ошибок</th><th>Проверен</th><th>Действия</th>
+          </tr>
+        </thead>
+        <tbody id="sources-tbody"></tbody>
+      </table>
+    </section>
+
+    <section id="panel-proxies" class="panel">
+      <div class="panel-header">
+        <h2>Таблица прокси</h2>
+        <div class="row">
+          <input type="text" id="proxy-search" placeholder="Поиск по хосту, порту, exit IP...">
+          <select id="proxy-filter-proto">
+            <option value="">Все протоколы</option>
+            <option value="http">HTTP</option>
+            <option value="socks5">SOCKS5</option>
+          </select>
+          <select id="proxy-filter-status">
+            <option value="">Все статусы</option>
+            <option value="unknown">unknown</option>
+            <option value="healthy">healthy</option>
+            <option value="degraded">degraded</option>
+            <option value="quarantined">quarantined</option>
+          </select>
+          <button id="btn-check-all" class="btn-primary">Проверить прокси</button>
+          <button id="btn-cancel-check" class="btn-danger">Отменить проверку</button>
+          <button id="btn-export-txt" class="btn-secondary">Экспорт TXT</button>
+          <button id="btn-export-json" class="btn-secondary">Экспорт JSON</button>
+        </div>
+      </div>
+      <div id="check-progress-bar" class="progress-line">Готов к проверке</div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>ID</th><th>Протокол</th><th>Endpoint</th><th>Статус</th><th>Рейтинг (0–100)</th><th>Эвристика полноты</th><th>Задержка (мс)</th><th>Exit IP</th><th>Capabilities (CONNECT / Remote DNS)</th><th>Источников</th>
+          </tr>
+        </thead>
+        <tbody id="proxies-tbody"></tbody>
+      </table>
+      <div class="pagination-row">
+        <button id="btn-prev-page" class="btn-secondary">← Назад</button>
+        <span id="page-indicator">Страница 1</span>
+        <button id="btn-next-page" class="btn-secondary">Вперёд →</button>
+      </div>
+    </section>
+
+    <section id="panel-pools" class="panel">
+      <h2>Пулы прокси и трассировка выбора (Decision Trace)</h2>
+      <div class="box">
+        <div class="row">
+          <input type="text" id="pool-test-name" value="Основной пул HTTPS" placeholder="Название пула">
+          <select id="pool-test-kind">
+            <option value="reliable">Надёжные (reliable)</option>
+            <option value="fast">Быстрые (fast)</option>
+            <option value="protocol">По протоколу</option>
+          </select>
+          <select id="pool-test-strategy">
+            <option value="best_score">Лучший рейтинг + гистерезис (best_score)</option>
+            <option value="failover">Резервирование (failover)</option>
+            <option value="round_robin">По кругу (round_robin)</option>
+            <option value="weighted">Взвешенный (weighted)</option>
+          </select>
+          <label><input type="checkbox" id="pool-req-connect" checked> Требовать CONNECT</label>
+          <label><input type="checkbox" id="pool-req-rdns" checked> Требовать Remote DNS</label>
+          <button id="btn-test-pool-select" class="btn-primary">Проверить выбор кандидата («Почему?»)</button>
+        </div>
+        <div id="pool-trace-output"></div>
+      </div>
+    </section>
+
+    <section id="panel-gateway" class="panel">
+      <h2>Локальный шлюз (HTTP CONNECT / SOCKS5) и проверка правил маршрутизации</h2>
+      <div class="box">
+        <h3>Сухой прогон правил (Dry-Run: «Какой резолвер и какой маршрут?»)</h3>
+        <div class="row">
+          <input type="text" id="dryrun-domain" value="api.example.com" placeholder="Домен для проверки">
+          <button id="btn-run-dryrun" class="btn-primary">Объяснить решение для домена</button>
+        </div>
+        <div id="dryrun-traces" class="split-grid"></div>
+      </div>
+      <h3>Активные и недавние соединения шлюза (без сохранения содержимого трафика)</h3>
+      <table class="data-table">
+        <thead>
+          <tr><th>ID</th><th>Протокол</th><th>Цель</th><th>Маршрут</th><th>Байт ↑ / ↓</th><th>Статус</th></tr>
+        </thead>
+        <tbody id="gw-conns-tbody"></tbody>
+      </table>
+    </section>
+
+    <section id="panel-dns" class="panel">
+      <h2>DNS-прокси в пользовательском режиме (без изменения системного DNS Windows)</h2>
+      <div class="box">
+        <h3>Ручной тест DNS-резолвера</h3>
+        <div class="row">
+          <input type="text" id="dns-test-domain" value="example.com" placeholder="Домен">
+          <select id="dns-test-qtype">
+            <option value="A">A (IPv4)</option>
+            <option value="AAAA">AAAA (IPv6)</option>
+          </select>
+          <button id="btn-dns-test" class="btn-primary">Разрешить и показать трассировку</button>
+        </div>
+        <div id="dns-test-output"></div>
+      </div>
+    </section>
+
+    <section id="panel-logs" class="panel">
+      <div class="panel-header">
+        <h2>Журнал событий и диагностический архив (секреты и пароли вырезаны)</h2>
+        <button id="btn-download-diag" class="btn-primary">Скачать диагностический архив (.zip)</button>
+      </div>
+      <pre id="logs-viewer" class="log-box"></pre>
+    </section>
+
+    <section id="panel-settings" class="panel">
+      <h2>Настройки, бюджеты ресурсов и резервное копирование SQLite</h2>
+      <div class="row">
+        <button id="btn-create-backup" class="btn-primary">Создать безопасный бэкап SQLite (VACUUM INTO)</button>
+        <button id="btn-export-config" class="btn-secondary">Экспорт конфигурации (без секретов)</button>
+      </div>
+      <div id="backup-status" class="status-msg"></div>
+      <pre id="budgets-viewer" class="log-box"></pre>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

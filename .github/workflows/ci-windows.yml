@@ -1,0 +1,44 @@
+name: Windows x64 Build and Verification
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  verify-and-build-windows:
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+
+      - name: Static analysis (go vet)
+        run: go vet ./...
+
+      - name: Run unit and integration tests
+        run: go test -v ./...
+
+      - name: Run race detector tests (CGO_ENABLED=1 for race instrumentation)
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race ./...
+
+      - name: Run bounded parser fuzzing (15s budget)
+        run: go test -fuzz=FuzzNormalizeProxyLine -fuzztime=15s ./internal/parsers
+
+      - name: Build portable Windows x64 executable (CGO_ENABLED=0)
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          go build -trimpath -ldflags="-s -w" -o dist/proxydesk.exe ./cmd/proxydesk
+          Copy-Item README.md dist/
+          Copy-Item THIRD_PARTY_NOTICES dist/
+          Compress-Archive -Path dist/* -DestinationPath proxydesk-windows-amd64.zip
+          Get-FileHash proxydesk-windows-amd64.zip -Algorithm SHA256 | Format-List
