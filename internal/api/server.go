@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/proxydesk/proxydesk/internal/app"
 	"github.com/proxydesk/proxydesk/internal/checker"
 	"github.com/proxydesk/proxydesk/internal/config"
 	"github.com/proxydesk/proxydesk/internal/diagnostics"
@@ -36,18 +37,19 @@ import (
 )
 
 type Server struct {
-	cfg           *config.Config
-	store         *storage.Store
-	credStore     *model.CredentialStore
-	sourceMgr     *sources.Manager
-	checker       *checker.Checker
-	scorer        *scoring.Scorer
-	poolSelector  *pools.Selector
-	gateway       *gateway.Gateway
-	dnsServer     *dns.Server
-	logger        *diagnostics.RotatingLogger
-	uiFS          fs.FS
-	token         string
+	app          *app.App
+	cfg          *config.Config
+	store        *storage.Store
+	credStore    *model.CredentialStore
+	sourceMgr    *sources.Manager
+	checker      *checker.Checker
+	scorer       *scoring.Scorer
+	poolSelector *pools.Selector
+	gateway      *gateway.Gateway
+	dnsServer    *dns.Server
+	logger       *diagnostics.RotatingLogger
+	uiFS         fs.FS
+	token        string
 
 	sseMu         sync.Mutex
 	sseClients    map[chan string]struct{}
@@ -60,6 +62,25 @@ func GenerateSessionToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+func NewServerWithApp(application *app.App, uiFS fs.FS, token string) *Server {
+	return &Server{
+		app:          application,
+		cfg:          application.Cfg,
+		store:        application.Store,
+		credStore:    application.CredStore,
+		sourceMgr:    application.SourceMgr,
+		checker:      application.Checker,
+		scorer:       application.Scorer,
+		poolSelector: application.PoolSelector,
+		gateway:      application.Gateway,
+		dnsServer:    application.DNSServer,
+		logger:       application.Logger,
+		uiFS:         uiFS,
+		token:        token,
+		sseClients:   make(map[chan string]struct{}),
+	}
 }
 
 func NewServer(
@@ -97,15 +118,17 @@ func (s *Server) Token() string {
 	return s.token
 }
 
-// Handler returns the root http.Handler protected against DNS rebinding (Host validation),
-// cross-origin requests (Origin/Sec-Fetch-Site validation), and CSRF (X-ProxyDesk-Token on mutating or API routes).
+func (s *Server) syncApp() {
+	if s.app != nil {
+		_ = s.app.SyncRuntimeState()
+	}
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// Unauthenticated loopback health endpoint for single-instance lock detection
 	mux.HandleFunc("/api/v1/health", s.handleHealth)
 
-	// Protected API endpoints
 	mux.HandleFunc("/api/v1/overview", s.requireToken(s.handleOverview))
 	mux.HandleFunc("/api/v1/proxies", s.requireToken(s.handleProxies))
 	mux.HandleFunc("/api/v1/proxies/import", s.requireToken(s.handleManualImport))
@@ -114,22 +137,32 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/proxies/export", s.requireToken(s.handleExportProxies))
 
 	mux.HandleFunc("/api/v1/sources", s.requireToken(s.handleSources))
+	mux.HandleFunc("/api/v1/sources/import", s.requireToken(s.handleImportSources))
 	mux.HandleFunc("/api/v1/sources/refresh", s.requireToken(s.handleRefreshSource))
 	mux.HandleFunc("/api/v1/sources/cancel", s.requireToken(s.handleCancelSource))
 	mux.HandleFunc("/api/v1/sources/export", s.requireToken(s.handleExportSources))
 
+	mux.HandleFunc("/api/v1/pools", s.requireToken(s.handlePools))
+	mux.HandleFunc("/api/v1/pools/activate", s.requireToken(s.handleActivatePool))
 	mux.HandleFunc("/api/v1/pools/select", s.requireToken(s.handlePoolSelect))
+
 	mux.HandleFunc("/api/v1/gateway/connections", s.requireToken(s.handleGatewayConnections))
+	mux.HandleFunc("/api/v1/gateway/toggle", s.requireToken(s.handleGatewayToggle))
+
+	mux.HandleFunc("/api/v1/dns/groups", s.requireToken(s.handleDNSGroups))
 	mux.HandleFunc("/api/v1/dns/test", s.requireToken(s.handleDNSTest))
+
+	mux.HandleFunc("/api/v1/rules/dns", s.requireToken(s.handleDNSRules))
+	mux.HandleFunc("/api/v1/rules/routing", s.requireToken(s.handleRoutingRules))
 	mux.HandleFunc("/api/v1/rules/test", s.requireToken(s.handleRulesDryRun))
 
 	mux.HandleFunc("/api/v1/diagnostics/logs", s.requireToken(s.handleLogs))
 	mux.HandleFunc("/api/v1/diagnostics/bundle", s.requireToken(s.handleDiagnosticBundle))
 	mux.HandleFunc("/api/v1/backup/create", s.requireToken(s.handleBackupCreate))
+	mux.HandleFunc("/api/v1/backup/restore", s.requireToken(s.handleBackupRestore))
 	mux.HandleFunc("/api/v1/config/export", s.requireToken(s.handleExportConfig))
 	mux.HandleFunc("/api/v1/events", s.requireToken(s.handleSSE))
 
-	// Static UI handler
 	mux.HandleFunc("/", s.handleUI)
 
 	return s.securityMiddleware(mux)
@@ -137,13 +170,10 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 1. Validate Host header to block DNS rebinding attacks
 		if !isAllowedLoopbackHost(r.Host) {
 			http.Error(w, "Forbidden Host header (DNS rebinding protection)", http.StatusForbidden)
 			return
 		}
-
-		// 2. Validate Origin and Sec-Fetch-Site headers on API calls
 		if origin := r.Header.Get("Origin"); origin != "" {
 			if !strings.HasPrefix(origin, "http://127.0.0.1:") && !strings.HasPrefix(origin, "http://localhost:") && !strings.HasPrefix(origin, "http://[::1]:") {
 				http.Error(w, "Forbidden Origin header", http.StatusForbidden)
@@ -154,8 +184,6 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 			http.Error(w, "Cross-site request blocked by Sec-Fetch-Site policy", http.StatusForbidden)
 			return
 		}
-
-		// Security response headers (no permissive CORS!)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; img-src 'self' data:;")
@@ -197,6 +225,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": s.cfg.Version})
 }
 
+// handleOverview returns real database counts AND actual bound listener addresses + bind errors
+// (never reporting unstarted config addresses as running — STABILIZATION-01 Section 2).
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	_, totalProxies, _ := s.store.ListProxies(storage.ProxyQueryFilter{Limit: 1})
 	_, healthyCount, _ := s.store.ListProxies(storage.ProxyQueryFilter{Status: "healthy", Limit: 1})
@@ -205,6 +235,13 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	_, quarantinedCount, _ := s.store.ListProxies(storage.ProxyQueryFilter{Status: "quarantined", Limit: 1})
 	srcs, _ := s.store.ListSources()
 
+	var lState app.ListenerState
+	if s.app != nil {
+		lState = s.app.ListenerState()
+	} else {
+		lState = app.ListenerState{BindErrors: map[string]string{}}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"proxies_total":       totalProxies,
 		"proxies_healthy":     healthyCount,
@@ -212,9 +249,12 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"proxies_degraded":    degradedCount,
 		"proxies_quarantined": quarantinedCount,
 		"sources_total":       len(srcs),
-		"http_gateway_addr":   s.cfg.HTTPGatewayAddr,
-		"socks5_gateway_addr": s.cfg.SOCKS5GatewayAddr,
-		"dns_listen_addr":     s.cfg.DNSListenAddr,
+		"listeners":           lState,
+		"http_gateway_addr":   lState.HTTPGatewayBoundAddr,
+		"socks5_gateway_addr": lState.SOCKS5GatewayBoundAddr,
+		"dns_listen_addr":     lState.DNSUDPBoundAddr,
+		"dns_tcp_addr":        lState.DNSTCPBoundAddr,
+		"bind_errors":         lState.BindErrors,
 		"dns_resolution_mode": s.cfg.DNSResolutionMode,
 		"strict_proxy_only":   s.cfg.StrictProxyOnly,
 		"budgets":             s.cfg.Budgets,
@@ -279,6 +319,7 @@ func (s *Server) handleManualImport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	s.syncApp()
 	s.logger.Log("INFO", "import", fmt.Sprintf("Manual import processed: valid=%d unique=%d errors=%d", stats.ValidCount, stats.UniqueCount, stats.ErrorCount))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"total_lines":  stats.TotalLines,
@@ -299,22 +340,31 @@ func (s *Server) handleCheckProxies(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	go func() {
+
+	runCheck := func(ctx context.Context) {
 		lastBroadcast := time.Time{}
-		s.checker.RunBatch(context.Background(), proxies, func(done, total int, res checker.CycleResult) {
+		s.checker.RunBatch(ctx, proxies, func(done, total int, res checker.CycleResult) {
 			for _, p := range proxies {
 				if p.ID == res.ProxyID {
 					_, _, _ = s.scorer.SaveCycleAndPrune(p, res)
 					break
 				}
 			}
-			// Throttled progress updates (at most every 150ms or on completion) so UI never freezes (Increment H)
 			if done == total || time.Since(lastBroadcast) >= 150*time.Millisecond {
 				lastBroadcast = time.Now()
 				s.broadcastSSE(fmt.Sprintf(`{"type":"check_progress","done":%d,"total":%d}`, done, total))
 			}
 		})
-	}()
+		s.syncApp()
+	}
+
+	if r.URL.Query().Get("sync") == "1" {
+		runCheck(r.Context())
+		writeJSON(w, http.StatusOK, map[string]any{"status": "completed", "checked": len(proxies)})
+		return
+	}
+
+	go runCheck(context.Background())
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "started", "queued": len(proxies)})
 }
 
@@ -349,6 +399,8 @@ func (s *Server) handleExportProxies(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// --- Sources CRUD + Import/Export/Refresh ---
+
 func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -372,9 +424,55 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusCreated, map[string]any{"id": id})
 
+	case http.MethodPut:
+		var src storage.SourceRecord
+		if err := json.NewDecoder(io.LimitReader(r.Body, 65536)).Decode(&src); err != nil || src.ID <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid source update payload"})
+			return
+		}
+		if err := s.store.UpdateSource(src); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"updated": src.ID})
+
+	case http.MethodDelete:
+		id, _ := strconv.Atoi(r.URL.Query().Get("id"))
+		if id <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing source id"})
+			return
+		}
+		if err := s.store.DeleteSource(id); err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) handleImportSources(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var list []storage.SourceRecord
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1024*1024)).Decode(&list); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid sources JSON array"})
+		return
+	}
+	imported := 0
+	for _, src := range list {
+		if src.Name == "" || src.Location == "" {
+			continue
+		}
+		if _, err := s.store.CreateSource(src); err == nil {
+			imported++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"imported": imported})
 }
 
 func (s *Server) handleRefreshSource(w http.ResponseWriter, r *http.Request) {
@@ -382,23 +480,18 @@ func (s *Server) handleRefreshSource(w http.ResponseWriter, r *http.Request) {
 		SourceID int `json:"source_id"`
 	}
 	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
-	list, err := s.store.ListSources()
+	src, err := s.store.GetSource(req.SourceID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "source not found"})
 		return
 	}
-	for _, src := range list {
-		if src.ID == req.SourceID {
-			prog, err := s.sourceMgr.RefreshSource(r.Context(), src)
-			if err != nil {
-				writeJSON(w, http.StatusBadGateway, prog)
-				return
-			}
-			writeJSON(w, http.StatusOK, prog)
-			return
-		}
+	prog, err := s.sourceMgr.RefreshSource(r.Context(), src)
+	s.syncApp()
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, prog)
+		return
 	}
-	writeJSON(w, http.StatusNotFound, map[string]string{"error": "source not found"})
+	writeJSON(w, http.StatusOK, prog)
 }
 
 func (s *Server) handleCancelSource(w http.ResponseWriter, r *http.Request) {
@@ -418,6 +511,84 @@ func (s *Server) handleExportSources(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_, _ = w.Write(data)
+}
+
+// --- Pools CRUD, Activation & Selection ---
+
+func (s *Server) handlePools(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		list, err := s.store.ListPools()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": list})
+
+	case http.MethodPost:
+		var p storage.PoolRecord
+		if err := json.NewDecoder(io.LimitReader(r.Body, 65536)).Decode(&p); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid pool JSON"})
+			return
+		}
+		id, err := s.store.CreatePool(p)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.syncApp()
+		writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+
+	case http.MethodPut:
+		var p storage.PoolRecord
+		if err := json.NewDecoder(io.LimitReader(r.Body, 65536)).Decode(&p); err != nil || p.ID <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid pool update payload"})
+			return
+		}
+		if err := s.store.UpdatePool(p); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.syncApp()
+		writeJSON(w, http.StatusOK, map[string]any{"updated": p.ID})
+
+	case http.MethodDelete:
+		id, _ := strconv.Atoi(r.URL.Query().Get("id"))
+		if id <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing pool id"})
+			return
+		}
+		if err := s.store.DeletePool(id); err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			return
+		}
+		s.syncApp()
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleActivatePool(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		PoolID        int  `json:"pool_id"`
+		ActiveProxyID *int `json:"active_proxy_id,omitempty"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.PoolID <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid pool activation request"})
+		return
+	}
+	if err := s.store.SetActivePool(req.PoolID, req.ActiveProxyID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	s.syncApp()
+	writeJSON(w, http.StatusOK, map[string]any{"activated_pool_id": req.PoolID})
 }
 
 func (s *Server) handlePoolSelect(w http.ResponseWriter, r *http.Request) {
@@ -449,10 +620,177 @@ func (s *Server) handlePoolSelect(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// --- Gateway Connections & Toggle ---
+
 func (s *Server) handleGatewayConnections(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"connections": s.gateway.RecentConnections(),
 	})
+}
+
+func (s *Server) handleGatewayToggle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Enable bool `json:"enable"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid toggle payload"})
+		return
+	}
+	if s.app == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "app lifecycle manager not attached"})
+		return
+	}
+	if req.Enable {
+		_ = s.app.StartGateway()
+	} else {
+		s.app.StopGateway()
+	}
+	writeJSON(w, http.StatusOK, s.app.ListenerState())
+}
+
+// --- DNS Groups, DNS Rules, Routing Rules ---
+
+func (s *Server) handleDNSGroups(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		list, err := s.store.ListDNSGroups()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": list})
+
+	case http.MethodPost:
+		var g storage.DNSGroupRecord
+		if err := json.NewDecoder(io.LimitReader(r.Body, 65536)).Decode(&g); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid DNS group JSON"})
+			return
+		}
+		id, err := s.store.CreateDNSGroup(g)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.syncApp()
+		writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+
+	case http.MethodPut:
+		var g storage.DNSGroupRecord
+		if err := json.NewDecoder(io.LimitReader(r.Body, 65536)).Decode(&g); err != nil || g.ID <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid DNS group update payload"})
+			return
+		}
+		if err := s.store.UpdateDNSGroup(g); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.syncApp()
+		writeJSON(w, http.StatusOK, map[string]any{"updated": g.ID})
+
+	case http.MethodDelete:
+		id, _ := strconv.Atoi(r.URL.Query().Get("id"))
+		if id <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing DNS group id"})
+			return
+		}
+		if err := s.store.DeleteDNSGroup(id); err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			return
+		}
+		s.syncApp()
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleDNSRules(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		list, err := s.store.ListDNSRules()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": list})
+
+	case http.MethodPost, http.MethodPut:
+		var rule rules.DNSRule
+		if err := json.NewDecoder(io.LimitReader(r.Body, 65536)).Decode(&rule); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid DNS rule JSON"})
+			return
+		}
+		id, err := s.store.SaveDNSRule(rule)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.syncApp()
+		writeJSON(w, http.StatusOK, map[string]any{"id": id})
+
+	case http.MethodDelete:
+		id, _ := strconv.Atoi(r.URL.Query().Get("id"))
+		if id <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing DNS rule id"})
+			return
+		}
+		if err := s.store.DeleteDNSRule(id); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		s.syncApp()
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleRoutingRules(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		list, err := s.store.ListRoutingRules()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": list})
+
+	case http.MethodPost, http.MethodPut:
+		var rule rules.RoutingRule
+		if err := json.NewDecoder(io.LimitReader(r.Body, 65536)).Decode(&rule); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid routing rule JSON"})
+			return
+		}
+		id, err := s.store.SaveRoutingRule(rule)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.syncApp()
+		writeJSON(w, http.StatusOK, map[string]any{"id": id})
+
+	case http.MethodDelete:
+		id, _ := strconv.Atoi(r.URL.Query().Get("id"))
+		if id <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing routing rule id"})
+			return
+		}
+		if err := s.store.DeleteRoutingRule(id); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		s.syncApp()
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *Server) handleDNSTest(w http.ResponseWriter, r *http.Request) {
@@ -468,7 +806,7 @@ func (s *Server) handleDNSTest(w http.ResponseWriter, r *http.Request) {
 	if strings.ToUpper(req.QType) == "AAAA" {
 		qt = dns.TypeAAAA
 	}
-	ips, rcode, trace, err := s.dnsServer.Resolve(r.Context(), req.Domain, qt)
+	ips, rcode, ttl, trace, err := s.dnsServer.ResolveWithTTL(r.Context(), req.Domain, qt)
 	var ipList []string
 	for _, ip := range ips {
 		ipList = append(ipList, ip.String())
@@ -481,6 +819,7 @@ func (s *Server) handleDNSTest(w http.ResponseWriter, r *http.Request) {
 		"domain":         req.Domain,
 		"ips":            ipList,
 		"rcode":          rcode,
+		"ttl":            ttl,
 		"decision_trace": trace,
 		"error":          errMsg,
 	})
@@ -496,9 +835,17 @@ func (s *Server) handleRulesDryRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid dry-run payload"})
 		return
 	}
+	dRules := req.DNSRules
+	if len(dRules) == 0 {
+		dRules, _ = s.store.ListDNSRules()
+	}
+	rRules := req.RoutingRules
+	if len(rRules) == 0 {
+		rRules, _ = s.store.ListRoutingRules()
+	}
 	now := time.Now().UTC()
-	dRule, dTrace := rules.EvaluateDNS(req.Domain, req.DNSRules, 1, now)
-	rRule, rTrace := rules.EvaluateRoute(req.Domain, req.RoutingRules, s.cfg.DNSResolutionMode, s.cfg.StrictProxyOnly, now)
+	dRule, dTrace := rules.EvaluateDNS(req.Domain, dRules, 1, now)
+	rRule, rTrace := rules.EvaluateRoute(req.Domain, rRules, s.cfg.DNSResolutionMode, s.cfg.StrictProxyOnly, now)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"dns_rule":    dRule,
 		"dns_trace":   dTrace,
@@ -513,8 +860,6 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleDiagnosticBundle creates a sanitized ZIP archive containing redacted configuration,
-// schema version, and redacted logs, without any passwords, session tokens, or traffic payloads (INV-05, Increment H).
 func (s *Server) handleDiagnosticBundle(w http.ResponseWriter, r *http.Request) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
@@ -550,6 +895,28 @@ func (s *Server) handleBackupCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"backup_file": "proxydesk-backup.db", "schema_version": storage.CurrentSchemaVersion})
+}
+
+func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		BackupFile string `json:"backup_file"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req)
+	fileName := filepath.Base(req.BackupFile)
+	if fileName == "" || fileName == "." || fileName == "/" {
+		fileName = "proxydesk-backup.db"
+	}
+	backupPath := filepath.Join(s.cfg.ResolvedDataDir, fileName)
+	if err := s.store.RestoreFromBackup(backupPath); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	s.syncApp()
+	writeJSON(w, http.StatusOK, map[string]any{"restored": fileName, "schema_version": storage.CurrentSchemaVersion})
 }
 
 func (s *Server) handleExportConfig(w http.ResponseWriter, r *http.Request) {

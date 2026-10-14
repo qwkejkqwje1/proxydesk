@@ -1,11 +1,13 @@
 package gateway
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -63,7 +65,7 @@ func TestInvariant_BlockRouteNeverDialsAndProxyOnlyNeverFallsBackToDirect(t *tes
 	gw.UpdateState(
 		[]rules.RoutingRule{{ID: 2, Priority: 1, Enabled: true, MatchType: rules.MatchAll, Pattern: "*", Action: "pool"}},
 		pools.PoolConfig{ID: 1, Name: "Default", Kind: "reliable", Strategy: "failover"},
-		[]storage.ProxyRecord{}, // Empty/dead pool
+		[]storage.ProxyRecord{},
 	)
 	_, _, _, errPool := gw.RouteAndDial(context.Background(), "127.0.0.1", originPort, true)
 	if !errors.Is(errPool, ErrNoHealthyProxyAvailable) {
@@ -74,58 +76,63 @@ func TestInvariant_BlockRouteNeverDialsAndProxyOnlyNeverFallsBackToDirect(t *tes
 	}
 }
 
-func TestGatewayFailoverSwitchesFromDeadPrimaryToBackupBeforeTunnelConfirmation(t *testing.T) {
+func TestGatewayPreservesBufferedBytesAndClearsHandshakeDeadline(t *testing.T) {
 	t0 := time.Date(2026, 10, 13, 17, 30, 0, 0, time.UTC)
 	clk := model.NewFakeClock(t0)
 	cfg := config.DefaultConfig()
+	cfg.Budgets.CheckHandshakeTimeoutMs = 150 // Short 150ms handshake deadline
 
-	// Backup proxy accepts CONNECT and echoes "OK"
-	backupLn, err := net.Listen("tcp", "127.0.0.1:0")
+	// Upstream proxy sends "HTTP/1.1 200 Connection Established\r\n\r\n" AND immediately pipelines "EARLY_BANNER\n"
+	// in the exact same write so bufio.Reader buffers "EARLY_BANNER\n"!
+	upLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer backupLn.Close()
+	defer upLn.Close()
 	go func() {
 		for {
-			c, err := backupLn.Accept()
+			c, err := upLn.Accept()
 			if err != nil {
 				return
 			}
 			go func(conn net.Conn) {
 				defer conn.Close()
-				buf := make([]byte, 512)
-				_, _ = conn.Read(buf)
-				_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+				br := bufio.NewReader(conn)
+				_, _ = http.ReadRequest(br)
+				_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\nEARLY_BANNER\n")
+				// Sleep 250ms (> 150ms handshake deadline) to verify handshake deadline was cleared!
+				time.Sleep(250 * time.Millisecond)
+				_, _ = io.WriteString(conn, "LATE_PAYLOAD\n")
 			}(c)
 		}
 	}()
-	_, backupPortStr, _ := net.SplitHostPort(backupLn.Addr().String())
-	backupPort, _ := strconv.Atoi(backupPortStr)
 
+	_, upPortStr, _ := net.SplitHostPort(upLn.Addr().String())
+	upPort, _ := strconv.Atoi(upPortStr)
 	confirmed := model.CapabilityRecord{State: model.CapabilityConfirmed, VerifiedAt: &t0}
-	var failedProxyID int
-	sel := pools.NewSelector(clk, 1)
-	gw := NewGateway(&cfg, model.NewCredentialStore(), sel, nil, clk, func(pid int, err error) {
-		failedProxyID = pid
-	})
 
+	sel := pools.NewSelector(clk, 1)
+	gw := NewGateway(&cfg, model.NewCredentialStore(), sel, nil, clk, nil)
 	gw.UpdateState(
 		nil,
-		pools.PoolConfig{ID: 1, Name: "Failover Pool", Kind: "reliable", Strategy: "failover", RequireConnect: true},
+		pools.PoolConfig{ID: 1, Name: "Pool", Kind: "reliable", Strategy: "failover", RequireConnect: true},
 		[]storage.ProxyRecord{
-			// Primary (ID=10, Score=95) points to closed port 1 -> fails pre-handshake
-			{ID: 10, Protocol: "http", Host: "127.0.0.1", Port: 1, Status: model.StatusHealthy, Score: 95.0, Capabilities: model.ProxyCapabilities{Connect: confirmed}},
-			// Backup (ID=20, Score=80) points to working backupLn -> succeeds
-			{ID: 20, Protocol: "http", Host: "127.0.0.1", Port: backupPort, Status: model.StatusHealthy, Score: 80.0, Capabilities: model.ProxyCapabilities{Connect: confirmed}},
+			{ID: 1, Protocol: "http", Host: "127.0.0.1", Port: upPort, Status: model.StatusHealthy, Score: 90.0, Capabilities: model.ProxyCapabilities{Connect: confirmed}},
 		},
 	)
 
-	conn, chosen, traces, err := gw.RouteAndDial(context.Background(), "example.com", "443", true)
+	conn, _, _, err := gw.RouteAndDial(context.Background(), "example.com", "443", true)
 	if err != nil {
-		t.Fatalf("expected failover to succeed via backup proxy, got err=%v", err)
+		t.Fatalf("RouteAndDial failed: %v", err)
 	}
 	defer conn.Close()
-	if chosen == nil || chosen.ID != 20 || failedProxyID != 10 {
-		t.Fatalf("expected chosen ID=20 and failedProxyID=10, got chosen=%+v failed=%d traces=%+v", chosen, failedProxyID, traces)
+
+	allBytes, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("reading tunnel stream after handshake deadline window failed: %v", err)
+	}
+	got := string(allBytes)
+	if !strings.HasPrefix(got, "EARLY_BANNER\n") || !strings.HasSuffix(got, "LATE_PAYLOAD\n") {
+		t.Fatalf("expected both buffered EARLY_BANNER and delayed LATE_PAYLOAD, got %q", got)
 	}
 }

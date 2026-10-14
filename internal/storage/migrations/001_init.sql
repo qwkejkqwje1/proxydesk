@@ -1,8 +1,13 @@
--- Migration 001: Initial schema for ProxyDesk (Increments A through H)
+-- Migration 001: Complete schema for ProxyDesk (STABILIZATION-01)
 
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sources (
@@ -66,6 +71,7 @@ CREATE TABLE IF NOT EXISTS proxies (
 CREATE INDEX IF NOT EXISTS idx_proxies_status_score ON proxies(status, score DESC);
 CREATE INDEX IF NOT EXISTS idx_proxies_protocol ON proxies(protocol);
 CREATE INDEX IF NOT EXISTS idx_proxies_host_port ON proxies(host, port);
+CREATE INDEX IF NOT EXISTS idx_proxies_next_check ON proxies(next_check_at);
 
 CREATE TABLE IF NOT EXISTS proxy_sources (
     proxy_id INTEGER NOT NULL,
@@ -126,6 +132,7 @@ CREATE TABLE IF NOT EXISTS pools (
     country_code TEXT NOT NULL DEFAULT '',
     hysteresis_delta REAL NOT NULL DEFAULT 5.0,
     active_proxy_id INTEGER,
+    is_default INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 
@@ -144,6 +151,7 @@ CREATE TABLE IF NOT EXISTS dns_groups (
     upstreams_json TEXT NOT NULL,
     bootstrap_ips_json TEXT NOT NULL DEFAULT '[]',
     allow_public_fallback INTEGER NOT NULL DEFAULT 0,
+    is_default INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 

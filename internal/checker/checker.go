@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/proxydesk/proxydesk/internal/config"
@@ -34,7 +35,7 @@ const (
 type TargetCheckResult struct {
 	TargetURL   string       `json:"target_url"`
 	Outcome     CheckOutcome `json:"outcome"`
-	StageFailed string       `json:"stage_failed,omitempty"` // "connect", "handshake", "tls", "request", "response"
+	StageFailed string       `json:"stage_failed,omitempty"`
 	ConnectMs   int          `json:"connect_ms"`
 	HandshakeMs int          `json:"handshake_ms"`
 	TTFBMs      int          `json:"ttfb_ms"`
@@ -44,26 +45,39 @@ type TargetCheckResult struct {
 }
 
 type CycleResult struct {
-	ProxyID          int                 `json:"proxy_id"`
-	CheckedAt        time.Time           `json:"checked_at"`
-	Outcome          CheckOutcome        `json:"outcome"`
-	TargetsTested    int                 `json:"targets_tested"`
-	TargetsSucceeded int                 `json:"targets_succeeded"`
-	ConnectMs        *int                `json:"connect_ms,omitempty"`
-	HandshakeMs      *int                `json:"handshake_ms,omitempty"`
-	TTFBMs           *int                `json:"ttfb_ms,omitempty"`
-	TotalMs          *int                `json:"total_ms,omitempty"`
-	ExitIP           string              `json:"exit_ip,omitempty"`
+	ProxyID          int                     `json:"proxy_id"`
+	CheckedAt        time.Time               `json:"checked_at"`
+	Outcome          CheckOutcome            `json:"outcome"`
+	TargetsTested    int                     `json:"targets_tested"`
+	TargetsSucceeded int                     `json:"targets_succeeded"`
+	ConnectMs        *int                    `json:"connect_ms,omitempty"`
+	HandshakeMs      *int                    `json:"handshake_ms,omitempty"`
+	TTFBMs           *int                    `json:"ttfb_ms,omitempty"`
+	TotalMs          *int                    `json:"total_ms,omitempty"`
+	ExitIP           string                  `json:"exit_ip,omitempty"`
 	Capabilities     model.ProxyCapabilities `json:"capabilities"`
-	TargetResults    []TargetCheckResult `json:"target_results"`
-	SummaryError     string              `json:"summary_error,omitempty"`
+	TargetResults    []TargetCheckResult     `json:"target_results"`
+	SummaryError     string                  `json:"summary_error,omitempty"`
+}
+
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) {
+	if b.r != nil && b.r.Buffered() > 0 {
+		return b.r.Read(p)
+	}
+	b.r = nil
+	return b.Conn.Read(p)
 }
 
 type Checker struct {
 	cfg       *config.Config
 	credStore *model.CredentialStore
 	clock     model.Clock
-	rootCAs   *x509.CertPool // nil uses system roots; overridden only in isolated local unit tests
+	rootCAs   *x509.CertPool
 	mu        sync.Mutex
 	cancelFn  context.CancelFunc
 	running   bool
@@ -93,8 +107,6 @@ func (c *Checker) CancelBatch() bool {
 	return false
 }
 
-// CheckProxyCycle runs a complete multi-target verification cycle for a single proxy candidate.
-// Enforces INV-03 (cancellation frees sockets), INV-04 (target outage -> inconclusive), and INV-08 (capability model).
 func (c *Checker) CheckProxyCycle(parentCtx context.Context, p storage.ProxyRecord) CycleResult {
 	now := c.clock.Now()
 	var enabledTargets []config.CheckTargetConfig
@@ -156,7 +168,7 @@ func (c *Checker) CheckProxyCycle(parentCtx context.Context, p storage.ProxyReco
 			Outcome:          OutcomeCancelled,
 			TargetsTested:    len(targetResults),
 			TargetsSucceeded: succeeded,
-			Capabilities:     p.Capabilities, // Do not mutate capabilities on cancellation
+			Capabilities:     p.Capabilities,
 			TargetResults:    targetResults,
 			SummaryError:     "check cancelled",
 		}
@@ -183,7 +195,6 @@ func (c *Checker) CheckProxyCycle(parentCtx context.Context, p storage.ProxyReco
 		}
 	}
 
-	// All targets failed: check if targets themselves are unreachable when diagnostic direct check is enabled
 	if c.cfg.EnableDirectDiag && !c.anyTargetReachableDirect(parentCtx, enabledTargets) {
 		return CycleResult{
 			ProxyID:          p.ID,
@@ -236,7 +247,6 @@ func (c *Checker) checkSingleTarget(parentCtx context.Context, p storage.ProxyRe
 	}
 	targetAddr := net.JoinHostPort(targetHost, targetPort)
 
-	// Stage 1: TCP connect to proxy
 	connTimeout := time.Duration(c.cfg.Budgets.CheckConnectTimeoutMs) * time.Millisecond
 	if connTimeout <= 0 {
 		connTimeout = 4 * time.Second
@@ -259,18 +269,22 @@ func (c *Checker) checkSingleTarget(parentCtx context.Context, p storage.ProxyRe
 	defer rawConn.Close()
 	connectMs := int(time.Since(t0).Milliseconds())
 
-	// Ensure context cancellation immediately unblocks any blocking socket read/write (INV-03)
+	var doneFlag atomic.Bool
 	stopCancelWatch := make(chan struct{})
-	defer close(stopCancelWatch)
+	defer func() {
+		doneFlag.Store(true)
+		close(stopCancelWatch)
+	}()
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = rawConn.SetDeadline(time.Now())
+			if !doneFlag.Load() {
+				_ = rawConn.SetDeadline(time.Now())
+			}
 		case <-stopCancelWatch:
 		}
 	}()
 
-	// Stage 2: Protocol handshake (SOCKS5 or HTTP CONNECT / Forward)
 	hsTimeout := time.Duration(c.cfg.Budgets.CheckHandshakeTimeoutMs) * time.Millisecond
 	if hsTimeout <= 0 {
 		hsTimeout = 4 * time.Second
@@ -278,6 +292,8 @@ func (c *Checker) checkSingleTarget(parentCtx context.Context, p storage.ProxyRe
 	_ = rawConn.SetDeadline(time.Now().Add(hsTimeout))
 	tHsStart := time.Now()
 	now := c.clock.Now()
+
+	var tunnelConn net.Conn = rawConn
 
 	switch p.Protocol {
 	case "socks5":
@@ -309,7 +325,7 @@ func (c *Checker) checkSingleTarget(parentCtx context.Context, p storage.ProxyRe
 
 	case "http":
 		if targetURL.Scheme == "https" {
-			statusCode, err := performHTTPConnectHandshake(rawConn, creds, targetAddr)
+			wrapped, statusCode, err := performHTTPConnectHandshake(rawConn, creds, targetAddr)
 			if err != nil {
 				if errors.Is(parentCtx.Err(), context.Canceled) {
 					return TargetCheckResult{TargetURL: target.URL, Outcome: OutcomeCancelled}, caps
@@ -329,6 +345,7 @@ func (c *Checker) checkSingleTarget(parentCtx context.Context, p storage.ProxyRe
 					ErrorDetail: err.Error(),
 				}, caps
 			}
+			tunnelConn = wrapped
 			caps.Connect = model.CapabilityRecord{State: model.CapabilityConfirmed, VerifiedAt: &now}
 			caps.RemoteDNS = model.CapabilityRecord{State: model.CapabilityConfirmed, VerifiedAt: &now}
 			if p.HasAuth {
@@ -337,15 +354,15 @@ func (c *Checker) checkSingleTarget(parentCtx context.Context, p storage.ProxyRe
 		}
 	}
 
-	var activeConn net.Conn = rawConn
+	var activeConn net.Conn = tunnelConn
 	if targetURL.Scheme == "https" {
 		tlsCfg := &tls.Config{
 			ServerName:         targetHost,
 			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: false, // Strictly enforced: never skip TLS verification
+			InsecureSkipVerify: false,
 			RootCAs:            c.rootCAs,
 		}
-		tlsConn := tls.Client(rawConn, tlsCfg)
+		tlsConn := tls.Client(tunnelConn, tlsCfg)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			if errors.Is(parentCtx.Err(), context.Canceled) {
 				return TargetCheckResult{TargetURL: target.URL, Outcome: OutcomeCancelled}, caps
@@ -362,8 +379,9 @@ func (c *Checker) checkSingleTarget(parentCtx context.Context, p storage.ProxyRe
 	}
 	handshakeMs := int(time.Since(tHsStart).Milliseconds())
 
-	// Stage 3 & 4: Send real HTTP request and read full bounded response
-	_ = activeConn.SetDeadline(time.Now().Add(totalTimeout))
+	// Clear handshake deadline and set request/response deadline for the remaining total budget
+	_ = rawConn.SetDeadline(time.Now().Add(totalTimeout))
+
 	reqURI := targetURL.RequestURI()
 	if p.Protocol == "http" && targetURL.Scheme == "http" {
 		reqURI = target.URL
@@ -481,7 +499,7 @@ func (c *Checker) checkSingleTarget(parentCtx context.Context, p storage.ProxyRe
 	}, caps
 }
 
-func performHTTPConnectHandshake(conn net.Conn, creds model.Credentials, targetAddr string) (int, error) {
+func performHTTPConnectHandshake(conn net.Conn, creds model.Credentials, targetAddr string) (net.Conn, int, error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: ProxyDesk-Checker/1.0\r\n", targetAddr, targetAddr)
 	if creds.Username != "" || creds.Password != "" {
@@ -491,22 +509,23 @@ func performHTTPConnectHandshake(conn net.Conn, creds model.Credentials, targetA
 	b.WriteString("\r\n")
 
 	if _, err := io.WriteString(conn, b.String()); err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
-		return 0, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return resp.StatusCode, fmt.Errorf("CONNECT rejected with HTTP %d", resp.StatusCode)
+		return nil, resp.StatusCode, fmt.Errorf("CONNECT rejected with HTTP %d", resp.StatusCode)
 	}
-	return http.StatusOK, nil
+	if br.Buffered() > 0 {
+		return &bufferedConn{Conn: conn, r: br}, http.StatusOK, nil
+	}
+	return conn, http.StatusOK, nil
 }
 
-// performSOCKS5Handshake negotiates SOCKS5 (RFC 1928 / RFC 1929) and sends domain names using ATYP=0x03
-// (remote DNS resolution on the SOCKS5 server without local DNS leak) when targetHost is a domain.
 func performSOCKS5Handshake(conn net.Conn, creds model.Credentials, targetHost, targetPortStr string) (string, error) {
 	hasAuth := creds.Username != "" || creds.Password != ""
 	var greeting []byte
@@ -544,9 +563,11 @@ func performSOCKS5Handshake(conn net.Conn, creds model.Credentials, targetHost, 
 		if _, err := io.ReadFull(conn, authResp); err != nil {
 			return "auth", err
 		}
-		if authResp[1] != 0x00 {
+		if authResp[0] != 0x01 || authResp[1] != 0x00 {
 			return "auth", errors.New("SOCKS5 username/password authentication failed")
 		}
+	} else if methodResp[1] != 0x00 {
+		return "auth", fmt.Errorf("unsupported SOCKS5 auth method 0x%02x", methodResp[1])
 	}
 
 	portNum, err := strconv.Atoi(targetPortStr)
@@ -554,7 +575,7 @@ func performSOCKS5Handshake(conn net.Conn, creds model.Credentials, targetHost, 
 		return "handshake", errors.New("invalid target port")
 	}
 
-	req := []byte{0x05, 0x01, 0x00} // VER=5, CMD=CONNECT(1), RSV=0
+	req := []byte{0x05, 0x01, 0x00}
 	ip := net.ParseIP(targetHost)
 	if ip4 := ip.To4(); ip4 != nil {
 		req = append(req, 0x01)
@@ -563,8 +584,8 @@ func performSOCKS5Handshake(conn net.Conn, creds model.Credentials, targetHost, 
 		req = append(req, 0x04)
 		req = append(req, ip6...)
 	} else {
-		if len(targetHost) > 255 {
-			return "remote_dns", errors.New("domain name exceeds 255 bytes")
+		if len(targetHost) == 0 || len(targetHost) > 255 {
+			return "remote_dns", errors.New("domain name length invalid")
 		}
 		req = append(req, 0x03, byte(len(targetHost)))
 		req = append(req, []byte(targetHost)...)
@@ -587,7 +608,6 @@ func performSOCKS5Handshake(conn net.Conn, creds model.Credentials, targetHost, 
 		}
 		return "handshake", fmt.Errorf("SOCKS5 connect failed with reply code %d", hdr[1])
 	}
-	// Drain bound address from SOCKS5 reply
 	var discardLen int
 	switch hdr[3] {
 	case 0x01:
@@ -647,7 +667,6 @@ func (c *Checker) anyTargetReachableDirect(ctx context.Context, targets []config
 	return false
 }
 
-// RunBatch checks a slice of proxies concurrently using a bounded worker pool.
 func (c *Checker) RunBatch(parentCtx context.Context, proxies []storage.ProxyRecord, onProgress func(done, total int, res CycleResult)) []CycleResult {
 	c.mu.Lock()
 	ctx, cancel := context.WithCancel(parentCtx)
